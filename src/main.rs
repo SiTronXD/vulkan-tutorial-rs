@@ -8,10 +8,9 @@ mod texture;
 
 use crate::{camera::*, context::*, debug::*, swapchain::*, texture::*};
 use ash::{
-    Device, Entry, Instance,
     ext::debug_utils,
     khr::{surface, swapchain as khr_swapchain},
-    vk,
+    vk, Device, Entry, Instance,
 };
 use cgmath::{Deg, Matrix4, Point3, Vector3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -234,7 +233,7 @@ impl VulkanApp {
         let command_pool = Self::create_command_pool(
             vk_context.device(),
             queue_families_indices,
-            vk::CommandPoolCreateFlags::empty(),
+            vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
         );
         let transient_command_pool = Self::create_command_pool(
             vk_context.device(),
@@ -284,9 +283,10 @@ impl VulkanApp {
             &indices,
         );
         let (uniform_buffers, uniform_buffer_memories) =
-            Self::create_uniform_buffers(&vk_context, images.len());
+            Self::create_uniform_buffers(&vk_context, MAX_FRAMES_IN_FLIGHT as usize);
 
-        let descriptor_pool = Self::create_descriptor_pool(vk_context.device(), images.len() as _);
+        let descriptor_pool =
+            Self::create_descriptor_pool(vk_context.device(), MAX_FRAMES_IN_FLIGHT as _);
         let descriptor_sets = Self::create_descriptor_sets(
             vk_context.device(),
             descriptor_pool,
@@ -295,19 +295,7 @@ impl VulkanApp {
             texture,
         );
 
-        let command_buffers = Self::create_and_register_command_buffers(
-            vk_context.device(),
-            command_pool,
-            &swapchain_framebuffers,
-            render_pass,
-            properties,
-            vertex_buffer,
-            index_buffer,
-            indices.len(),
-            layout,
-            &descriptor_sets,
-            pipeline,
-        );
+        let command_buffers = Self::create_command_buffers(vk_context.device(), command_pool);
 
         let in_flight_frames = Self::create_sync_objects(vk_context.device());
 
@@ -1896,9 +1884,20 @@ impl VulkanApp {
         panic!("Failed to find suitable memory type.")
     }
 
-    fn create_and_register_command_buffers(
+    fn create_command_buffers(device: &Device, pool: vk::CommandPool) -> Vec<vk::CommandBuffer> {
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(MAX_FRAMES_IN_FLIGHT as _);
+
+        let buffers = unsafe { device.allocate_command_buffers(&allocate_info).unwrap() };
+
+        buffers
+    }
+
+    fn record_command_buffer(
         device: &Device,
-        pool: vk::CommandPool,
+        cmd_buffer: vk::CommandBuffer,
         framebuffers: &[vk::Framebuffer],
         render_pass: vk::RenderPass,
         swapchain_properties: SwapchainProperties,
@@ -1908,100 +1907,102 @@ impl VulkanApp {
         pipeline_layout: vk::PipelineLayout,
         descriptor_sets: &[vk::DescriptorSet],
         graphics_pipeline: vk::Pipeline,
-    ) -> Vec<vk::CommandBuffer> {
-        let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(framebuffers.len() as _);
+        frame_index: usize,
+        image_index: usize,
+    ) -> bool {
+        let framebuffer = framebuffers[image_index];
 
-        let buffers = unsafe { device.allocate_command_buffers(&allocate_info).unwrap() };
+        unsafe {
+            device
+                .reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::empty())
+                .unwrap();
+        }
 
-        buffers.iter().enumerate().for_each(|(i, buffer)| {
-            let buffer = *buffer;
-            let framebuffer = framebuffers[i];
-
-            // begin command buffer
-            {
-                let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE);
-                // .inheritance_info() null since it's a primary command buffer
-                unsafe {
-                    device
-                        .begin_command_buffer(buffer, &command_buffer_begin_info)
-                        .unwrap()
-                };
-            }
-
-            // begin render pass
-            {
-                let clear_values = [
-                    vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.0, 0.0, 0.0, 1.0],
-                        },
-                    },
-                    vk::ClearValue {
-                        depth_stencil: vk::ClearDepthStencilValue {
-                            depth: 1.0,
-                            stencil: 0,
-                        },
-                    },
-                ];
-                let render_pass_begin_info = vk::RenderPassBeginInfo::default()
-                    .render_pass(render_pass)
-                    .framebuffer(framebuffer)
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: swapchain_properties.extent,
-                    })
-                    .clear_values(&clear_values);
-
-                unsafe {
-                    device.cmd_begin_render_pass(
-                        buffer,
-                        &render_pass_begin_info,
-                        vk::SubpassContents::INLINE,
-                    )
-                };
-            }
-
-            // Bind pipeline
+        // begin command buffer
+        {
+            let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE);
+            // .inheritance_info() null since it's a primary command buffer
             unsafe {
-                device.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, graphics_pipeline)
+                device
+                    .begin_command_buffer(cmd_buffer, &command_buffer_begin_info)
+                    .unwrap()
             };
+        }
 
-            // Bind vertex buffer
-            let vertex_buffers = [vertex_buffer];
-            let offsets = [0];
-            unsafe { device.cmd_bind_vertex_buffers(buffer, 0, &vertex_buffers, &offsets) };
+        // begin render pass
+        {
+            let clear_values = [
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                },
+            ];
+            let render_pass_begin_info = vk::RenderPassBeginInfo::default()
+                .render_pass(render_pass)
+                .framebuffer(framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: swapchain_properties.extent,
+                })
+                .clear_values(&clear_values);
 
-            // Bind index buffer
-            unsafe { device.cmd_bind_index_buffer(buffer, index_buffer, 0, vk::IndexType::UINT32) };
-
-            // Bind descriptor set
             unsafe {
-                let null = [];
-                device.cmd_bind_descriptor_sets(
-                    buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline_layout,
-                    0,
-                    &descriptor_sets[i..=i],
-                    &null,
+                device.cmd_begin_render_pass(
+                    cmd_buffer,
+                    &render_pass_begin_info,
+                    vk::SubpassContents::INLINE,
                 )
             };
+        }
 
-            // Draw
-            unsafe { device.cmd_draw_indexed(buffer, index_count as _, 1, 0, 0, 0) };
+        // Bind pipeline
+        unsafe {
+            device.cmd_bind_pipeline(
+                cmd_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                graphics_pipeline,
+            )
+        };
 
-            // End render pass
-            unsafe { device.cmd_end_render_pass(buffer) };
+        // Bind vertex buffer
+        let vertex_buffers = [vertex_buffer];
+        let offsets = [0];
+        unsafe { device.cmd_bind_vertex_buffers(cmd_buffer, 0, &vertex_buffers, &offsets) };
 
-            // End command buffer
-            unsafe { device.end_command_buffer(buffer).unwrap() };
-        });
+        // Bind index buffer
+        unsafe { device.cmd_bind_index_buffer(cmd_buffer, index_buffer, 0, vk::IndexType::UINT32) };
 
-        buffers
+        // Bind descriptor set
+        unsafe {
+            let null = [];
+            device.cmd_bind_descriptor_sets(
+                cmd_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                0,
+                &descriptor_sets[frame_index..=frame_index],
+                &null,
+            )
+        };
+
+        // Draw
+        unsafe { device.cmd_draw_indexed(cmd_buffer, index_count as _, 1, 0, 0, 0) };
+
+        // End render pass
+        unsafe { device.cmd_end_render_pass(cmd_buffer) };
+
+        // End command buffer
+        unsafe { device.end_command_buffer(cmd_buffer).unwrap() };
+
+        true
     }
 
     fn create_sync_objects(device: &Device) -> InFlightFrames {
@@ -2071,7 +2072,29 @@ impl VulkanApp {
 
         unsafe { self.vk_context.device().reset_fences(&wait_fences).unwrap() };
 
-        self.update_uniform_buffers(image_index);
+        let curr_cmd_buffer = self.command_buffers[self.in_flight_frames.current_frame];
+        let _record_result = VulkanApp::record_command_buffer(
+            self.vk_context.device(),
+            curr_cmd_buffer,
+            &self.swapchain_framebuffers,
+            self.render_pass,
+            self.swapchain_properties,
+            self.vertex_buffer,
+            self.index_buffer,
+            self.model_index_count,
+            self.pipeline_layout,
+            &self.descriptor_sets,
+            self.pipeline,
+            self.in_flight_frames.current_frame,
+            image_index as usize,
+        );
+        // TODO: fix matching result
+        /*match result {
+            true => {}
+            false => panic!("Failed to record command buffer."),
+        }*/
+
+        self.update_uniform_buffers(self.in_flight_frames.current_frame as u32);
 
         let device = self.vk_context.device();
         let wait_semaphores = [image_available_semaphore];
@@ -2080,7 +2103,7 @@ impl VulkanApp {
         // Submit command buffer
         {
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let command_buffers = [self.command_buffers[image_index as usize]];
+            let command_buffers = [curr_cmd_buffer];
             let submit_info = vk::SubmitInfo::default()
                 .wait_semaphores(&wait_semaphores)
                 .wait_dst_stage_mask(&wait_stages)
@@ -2180,20 +2203,6 @@ impl VulkanApp {
             properties,
         );
 
-        let command_buffers = Self::create_and_register_command_buffers(
-            device,
-            self.command_pool,
-            &swapchain_framebuffers,
-            render_pass,
-            properties,
-            self.vertex_buffer,
-            self.index_buffer,
-            self.model_index_count,
-            layout,
-            &self.descriptor_sets,
-            pipeline,
-        );
-
         self.swapchain = swapchain;
         self.swapchain_khr = swapchain_khr;
         self.swapchain_properties = properties;
@@ -2205,7 +2214,6 @@ impl VulkanApp {
         self.color_texture = color_texture;
         self.depth_texture = depth_texture;
         self.swapchain_framebuffers = swapchain_framebuffers;
-        self.command_buffers = command_buffers;
     }
 
     /// Clean up the swapchain and all resources that depends on it.
@@ -2228,7 +2236,7 @@ impl VulkanApp {
         }
     }
 
-    fn update_uniform_buffers(&mut self, current_image: u32) {
+    fn update_uniform_buffers(&mut self, frame_index: u32) {
         if self.is_left_clicked && self.cursor_delta.is_some() {
             let delta = self.cursor_delta.take().unwrap();
             let x_ratio = delta[0] as f32 / self.swapchain_properties.extent.width as f32;
@@ -2254,7 +2262,7 @@ impl VulkanApp {
         };
         let ubos = [ubo];
 
-        let buffer_mem = self.uniform_buffer_memories[current_image as usize];
+        let buffer_mem = self.uniform_buffer_memories[frame_index as usize];
         let size = size_of::<UniformBufferObject>() as vk::DeviceSize;
         unsafe {
             let device = self.vk_context.device();
