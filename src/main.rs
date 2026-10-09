@@ -8,9 +8,10 @@ mod texture;
 
 use crate::{camera::*, context::*, debug::*, swapchain::*, texture::*};
 use ash::{
+    Device, Entry, Instance,
     ext::debug_utils,
     khr::{surface, swapchain as khr_swapchain},
-    vk, Device, Entry, Instance,
+    vk,
 };
 use cgmath::{Deg, Matrix4, Point3, Vector3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -150,6 +151,7 @@ struct VulkanApp {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     swapchain_framebuffers: Vec<vk::Framebuffer>,
+    render_finished_semaphores: Vec<vk::Semaphore>,
     command_pool: vk::CommandPool,
     transient_command_pool: vk::CommandPool,
     msaa_samples: vk::SampleCountFlags,
@@ -267,6 +269,9 @@ impl VulkanApp {
             properties,
         );
 
+        let render_finished_semaphores =
+            Self::create_render_finished_semaphores(vk_context.device(), &swapchain_framebuffers);
+
         let texture = Self::create_texture_image(&vk_context, command_pool, graphics_queue);
 
         let (vertices, indices) = Self::load_model();
@@ -321,6 +326,7 @@ impl VulkanApp {
             pipeline_layout: layout,
             pipeline,
             swapchain_framebuffers,
+            render_finished_semaphores,
             command_pool,
             transient_command_pool,
             msaa_samples,
@@ -1036,6 +1042,19 @@ impl VulkanApp {
                 unsafe { device.create_framebuffer(&framebuffer_info, None).unwrap() }
             })
             .collect::<Vec<_>>()
+    }
+
+    fn create_render_finished_semaphores(
+        device: &Device,
+        framebuffers: &Vec<vk::Framebuffer>,
+    ) -> Vec<vk::Semaphore> {
+        framebuffers
+            .iter()
+            .map(|_| {
+                let semaphore_info = vk::SemaphoreCreateInfo::default();
+                unsafe { device.create_semaphore(&semaphore_info, None).unwrap() }
+            })
+            .collect()
     }
 
     fn create_command_pool(
@@ -2013,11 +2032,6 @@ impl VulkanApp {
                 unsafe { device.create_semaphore(&semaphore_info, None).unwrap() }
             };
 
-            let render_finished_semaphore = {
-                let semaphore_info = vk::SemaphoreCreateInfo::default();
-                unsafe { device.create_semaphore(&semaphore_info, None).unwrap() }
-            };
-
             let in_flight_fence = {
                 let fence_info =
                     vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
@@ -2026,7 +2040,6 @@ impl VulkanApp {
 
             let sync_objects = SyncObjects {
                 image_available_semaphore,
-                render_finished_semaphore,
                 fence: in_flight_fence,
             };
             sync_objects_vec.push(sync_objects)
@@ -2041,9 +2054,9 @@ impl VulkanApp {
 
     pub fn draw_frame(&mut self) -> bool {
         log::trace!("Drawing frame.");
+        let current_frame = self.in_flight_frames.current_frame;
         let sync_objects = self.in_flight_frames.next().unwrap();
         let image_available_semaphore = sync_objects.image_available_semaphore;
-        let render_finished_semaphore = sync_objects.render_finished_semaphore;
         let in_flight_fence = sync_objects.fence;
         let wait_fences = [in_flight_fence];
 
@@ -2072,8 +2085,8 @@ impl VulkanApp {
 
         unsafe { self.vk_context.device().reset_fences(&wait_fences).unwrap() };
 
-        let curr_cmd_buffer = self.command_buffers[self.in_flight_frames.current_frame];
-        let _record_result = VulkanApp::record_command_buffer(
+        let curr_cmd_buffer = self.command_buffers[current_frame];
+        let record_result = VulkanApp::record_command_buffer(
             self.vk_context.device(),
             curr_cmd_buffer,
             &self.swapchain_framebuffers,
@@ -2085,16 +2098,17 @@ impl VulkanApp {
             self.pipeline_layout,
             &self.descriptor_sets,
             self.pipeline,
-            self.in_flight_frames.current_frame,
+            current_frame,
             image_index as usize,
         );
-        // TODO: fix matching result
-        /*match result {
-            true => {}
+        match record_result {
+            true => (),
             false => panic!("Failed to record command buffer."),
-        }*/
+        };
 
-        self.update_uniform_buffers(self.in_flight_frames.current_frame as u32);
+        self.update_uniform_buffers(current_frame as u32);
+
+        let render_finished_semaphore = self.render_finished_semaphores[image_index as usize];
 
         let device = self.vk_context.device();
         let wait_semaphores = [image_available_semaphore];
@@ -2203,6 +2217,9 @@ impl VulkanApp {
             properties,
         );
 
+        let render_finished_semaphores =
+            Self::create_render_finished_semaphores(device, &swapchain_framebuffers);
+
         self.swapchain = swapchain;
         self.swapchain_khr = swapchain_khr;
         self.swapchain_properties = properties;
@@ -2214,6 +2231,7 @@ impl VulkanApp {
         self.color_texture = color_texture;
         self.depth_texture = depth_texture;
         self.swapchain_framebuffers = swapchain_framebuffers;
+        self.render_finished_semaphores = render_finished_semaphores;
     }
 
     /// Clean up the swapchain and all resources that depends on it.
@@ -2225,7 +2243,9 @@ impl VulkanApp {
             self.swapchain_framebuffers
                 .iter()
                 .for_each(|f| device.destroy_framebuffer(*f, None));
-            device.free_command_buffers(self.command_pool, &self.command_buffers);
+            self.render_finished_semaphores
+                .iter()
+                .for_each(|rfs| device.destroy_semaphore(*rfs, None));
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_render_pass(self.render_pass, None);
@@ -2297,6 +2317,7 @@ impl Drop for VulkanApp {
             device.destroy_buffer(self.vertex_buffer, None);
             device.free_memory(self.vertex_buffer_memory, None);
             self.texture.destroy(device);
+            device.free_command_buffers(self.command_pool, &self.command_buffers);
             device.destroy_command_pool(self.transient_command_pool, None);
             device.destroy_command_pool(self.command_pool, None);
         }
@@ -2312,7 +2333,6 @@ struct QueueFamiliesIndices {
 #[derive(Clone, Copy)]
 struct SyncObjects {
     image_available_semaphore: vk::Semaphore,
-    render_finished_semaphore: vk::Semaphore,
     fence: vk::Fence,
 }
 
@@ -2320,7 +2340,6 @@ impl SyncObjects {
     fn destroy(&self, device: &Device) {
         unsafe {
             device.destroy_semaphore(self.image_available_semaphore, None);
-            device.destroy_semaphore(self.render_finished_semaphore, None);
             device.destroy_fence(self.fence, None);
         }
     }
